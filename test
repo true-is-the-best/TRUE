@@ -1,0 +1,231 @@
+proc sql;
+create table switching_temp1 as 
+select distinct t1.* , t2.mid, 
+case when substr(div_cd,1,4) = '4127' then '1.imatinib'
+when substr(div_cd,1,4) = '4933' then '3.dasatinib'
+when substr(div_cd,1,4) = '5626' then '2.nilotinib'
+when substr(div_cd,1,4) = '6177' then '4.radotinib'
+when substr(div_cd,1,4) = '6696' then '5.ponatinib' end as tki_grp,
+t2.TOT_INJC_DDCNT_EXEC_FQ,
+t2.recu_fr_dd as tki_strt_dt,
+put(input(t2.recu_fr_dd,yymmdd10.)+t2.TOT_INJC_DDCNT_EXEC_FQ, yymmdd10.) as tki_end_dt
+from datasave.patient_filter t1 left join datasave.tki_t300_530 t2
+on t1.jid = t2.jid
+order by jid, tki_strt_dt, tki_end_dt
+;
+quit;
+
+data switching_temp2;
+set switching_temp1;
+format tki_end_dt $10.;
+by jid;
+	lag_tki_end_dt = lag(tki_end_dt);
+	diff = input(tki_strt_dt, yymmdd10.)-input(lag_tki_end_dt, yymmdd10.);
+
+retain tki_grp_tmp switching_num;
+if first.jid then do;
+	lag_tki_end_dt = '';
+	diff = '';
+	tki_grp_tmp = tki_grp;
+	switching_num = 1;
+end;
+else if tki_grp_tmp ^= tki_grp or diff > 90 then do;
+	tki_grp_tmp = tki_grp;
+	switching_num = switching_num+1;
+end;
+else do;
+	tki_grp_tmp = tki_grp_tmp;
+	switching_num=switching_num;
+end;
+run;
+
+proc sql;
+create table switching_temp3 as
+select distinct JID,
+SEX_TP_CD,
+index_age,
+cml_strt_dt,
+tki_grp,
+min(tki_strt_dt) as tki_strt_dt,
+max(tki_end_dt) as tki_end_dt,
+switching_num
+from switching_temp2
+group by jid, switching_num
+order by jid, switching_num
+;
+quit;
+
+
+/*같은날에 두가지이상 성분을 처방받았을때 처방기간이 더 긴 약제 남기기*/
+PROC SQL;
+CREATE TABLE switching_temp5 AS
+SELECT *
+FROM switching_temp3
+GROUP BY jid, tki_strt_dt
+HAVING MAX(tki_end_dt) = tki_end_dt
+;
+QUIT;
+
+
+/*위 내용 반복*/
+data switching_temp6;
+set switching_temp5;
+format tki_end_dt $10.;
+by jid;
+	lag_tki_end_dt = lag(tki_end_dt);
+	diff = input(tki_strt_dt, yymmdd10.)-input(lag_tki_end_dt, yymmdd10.);
+
+retain tki_grp_tmp switching_num2;
+if first.jid then do;
+	lag_tki_end_dt = '';
+	diff = '';
+	tki_grp_tmp = tki_grp;
+	switching_num2 = 1;
+end;
+else if tki_grp_tmp ^= tki_grp or diff > 90 then do;
+	tki_grp_tmp = tki_grp;
+	switching_num2 = switching_num2+1;
+end;
+else do;
+	tki_grp_tmp = tki_grp_tmp;
+	switching_num2=switching_num2;
+end;
+run;
+
+proc sql;
+create table switching_temp7 as
+select distinct JID,
+SEX_TP_CD,
+index_age,
+cml_strt_dt,
+tki_grp,
+tki_grp_tmp,
+min(tki_strt_dt) as tki_strt_dt,
+max(tki_end_dt) as tki_end_dt,
+min(input(tki_strt_dt, yymmdd8.))-min(input(lag_tki_end_dt, yymmdd10.)) as diff,
+switching_num2
+from switching_temp6
+group by jid, switching_num2
+order by jid, switching_num2
+;
+quit;
+
+
+/*처방 GAP이 90일 초과일때부터 스위칭에서 제외*/
+PROC SQL;
+CREATE TABLE switching_temp8 AS
+SELECT *
+FROM switching_temp7
+GROUP BY jid
+HAVING min(case when diff > 90 then switching_num2 else 999 end) > switching_num2
+;
+QUIT;
+
+
+
+
+proc sql;
+create table switching_temp9 as
+select distinct
+t1.JID,
+t1.SEX_TP_CD,
+t1.index_age,
+t1.cml_strt_dt,
+year(input(t1.cml_strt_dt, yymmdd10.)) as cml_strt_year,
+t1.tki_grp,
+t1.tki_strt_dt,
+put(case when t2.jid is null then input(t1.tki_end_dt,yymmdd10.)
+when input(t2.tki_strt_dt,yymmdd10.) <= input(t1.tki_end_dt,yymmdd10.) then input(t2.tki_strt_dt,yymmdd10.)-1
+else input(t1.tki_end_dt,yymmdd10.) end, yymmdd10.) as tki_end_dt,
+t1.switching_num2
+from switching_temp8 t1 left join switching_temp8 t2
+on t1.jid=t2.jid and t1.switching_num2=t2.switching_num2-1
+;
+quit;
+
+
+
+/*end date 정의*/
+/* 1.chemo 처방
+2. HSCT 기록
+3. 연구종료
+4. 사망*/
+proc sql;
+create table temp as
+select distinct t1.*, min(input(t2.recu_fr_dd,yymmdd8.)) as chemo_dt,min(input(t3.recu_fr_dd,yymmdd8.)) as hsct_dt, min(input(t4.recu_fr_dd,yymmdd8.)) as death_dt
+from switching_temp9 t1
+left join datasave.chemo_t300_530 t2 on t1.jid = t2.jid and input(t1.cml_strt_dt,yymmdd10.) <= input(t2.recu_fr_dd,yymmdd10.)
+left join datasave.stem_cell_t300 t3 on t1.jid = t3.jid and input(t1.cml_strt_dt,yymmdd10.) <= input(t3.recu_fr_dd,yymmdd10.)
+left join source.T200_2024Q2_25 t4 on t1.jid = t4.jid and t4.DGRSLT_TP_CD='4'
+group by t1.jid
+;
+create table temp2 as
+select *, put(min(chemo_dt, hsct_dt, death_dt),yymmdd10.) as min_dt
+from temp
+where min(chemo_dt, hsct_dt, death_dt) is null or min(chemo_dt, hsct_dt, death_dt) >= input(tki_strt_dt,yymmdd10.)
+order by jid, switching_num2
+;
+quit;
+
+data switching_temp10;
+set temp2;
+format death_dt yymmdd10.;
+by jid;
+if (chemo_dt ^=. or hsct_dt ^=. or death_dt ^=.) and last.jid then tki_end=min(input(tki_end_dt,yymmdd10.), chemo_dt, hsct_dt, death_dt);
+else if last.jid and input(tki_end_dt,yymmdd10.) > input('2023-07-31',yymmdd10.) then tki_end=input('2023-07-31',yymmdd10.);
+else tki_end=input(tki_end_dt,yymmdd10.);
+tki_end_dt=put(tki_end, yymmdd10.);
+drop chemo_dt hsct_dt tki_end min_dt;
+run;
+
+
+/*switching 종료 후 재개 성분 붙이기*/
+proc sql;
+CREATE TABLE switching_temp7_gap AS
+SELECT distinct jid, tki_grp as gap_tki_grp, diff as gap, switching_num2 as gap_switching_num
+FROM switching_temp7
+GROUP BY jid
+HAVING min(case when diff > 90 then switching_num2 else 999 end) = switching_num2
+;
+QUIT;
+
+PROC SQL;
+create table datasave.switching as
+select t1.*,
+(input(tki_end_dt,yymmdd10.) - input(tki_strt_dt,yymmdd8.))/30.5 as switching_du,
+case when input(tki_end_dt, yymmdd10.) = death_dt then 0
+when input(tki_end_dt, yymmdd10.) >= (input('2023-07-31', yymmdd10.)-90) then 0 else 1 end as persistence_event,
+case when input(tki_end_dt, yymmdd10.) = death_dt then 1 else 0 end as death_yn,
+case when gap_tki_grp is null then 'end' else gap_tki_grp end as gap_tki_grp,
+case when gap_tki_grp is null then input('2023-07-31', yymmdd10.) - max(input(tki_end_dt, yymmdd10.)) else gap end as gap,
+case when gap_tki_grp is null then 999 else gap_switching_num end as gap_switching_num
+from switching_temp10 t1 LEFT JOIN switching_temp7_gap t2 ON t1.jid=t2.jid
+group by t1.jid
+;
+quit;
+
+proc sql;
+/*쿼리체크*/
+SELECT COUNT(distinct JID)
+FROM datasave.switching
+;
+QUIT;
+
+
+
+/* 5회이상 스위칭한 환자수 체크 */
+proc sql;
+create table tmp as
+select *
+from datasave.switching
+group by jid, tki_strt_dt
+having count(*) =1;
+
+create table tmp2 as
+select *
+from datasave.switching
+where jid in (select jid from tmp) AND switching_num2 >= 5;
+
+select count( distinct jid )
+from tmp2;
+quit;
